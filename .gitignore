@@ -1,0 +1,7 @@
+data/snapshots/
+data/analog_db/
+models/
+signals/
+*.pyc
+__pycache__/
+.env

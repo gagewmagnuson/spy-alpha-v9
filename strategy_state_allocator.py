@@ -1,0 +1,1 @@
+"""SPY Alpha v9 — Strategy 1: State-responsive allocator replacing V8 regime allocator (stub)."""

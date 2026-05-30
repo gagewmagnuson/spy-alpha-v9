@@ -1,0 +1,1 @@
+"""SPY Alpha v9 — Conviction Governor: triple-gated conviction budget and dynamic ceilings (stub)."""

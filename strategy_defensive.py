@@ -1,0 +1,1 @@
+"""SPY Alpha v9 — Strategy 3: Defensive/Tail Protection, modified from v8 (stub)."""

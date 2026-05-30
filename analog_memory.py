@@ -1,0 +1,1 @@
+"""SPY Alpha v9 — Analog Memory: state vector DB, KNN retrieval, coherence, reliability, hazard (stub)."""

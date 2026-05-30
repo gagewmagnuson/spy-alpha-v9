@@ -1,0 +1,1 @@
+"""SPY Alpha v9 — Trajectory: velocity, persistence, divergence, stability per pillar (stub)."""

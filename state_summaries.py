@@ -1,0 +1,1 @@
+"""SPY Alpha v9 — State Summaries: derived risk appetite, market quality, transition instability (stub)."""
