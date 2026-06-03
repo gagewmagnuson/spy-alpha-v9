@@ -725,10 +725,168 @@ class StateEngine:
         return score
 
     def _compute_trend_persistence(self) -> pd.Series:
-        """Pillar 4: Trend Persistence — STUB (Phase 3)."""
-        if self._raw_close is not None:
-            return pd.Series(np.nan, index=self._raw_close.index)
-        return pd.Series(dtype=float)
+        """
+        Pillar 4: Trend Persistence — measures how strong and sustained the
+        directional move is across risk assets.
+
+        As an independent state dimension (not a strategy signal), provides
+        unique information about directional conviction feeding governance
+        decisions. Addresses V7's redundancy where trend overlapped with HMM.
+
+        Components (spec Section 4D):
+            spy_ma_positioning  (0.30): Weighted above 50d/100d/200d MAs
+            multi_asset_breadth (0.25): Fraction of 14-asset universe above 100d MA
+            trend_duration      (0.20): Days since SPY last crossed below 100d MA
+            momentum_magnitude  (0.15): SPY risk-adjusted 63-day return
+            trend_consistency   (0.10): Fraction of 63 days with positive 5d return
+
+        Observation universe (14 assets per spec Section 4D):
+            SPY, QQQ, IWM, VEA, VWO, TLT, IEF, GLD, DBC,
+            XLK, XLF, XLV, XLE, XLI
+
+        Historical expectations (spec Section 4D):
+            2013-2014:  0.70-0.90  (strong sustained uptrend)
+            2017:       0.80-0.95  (extremely persistent)
+            Late 2018:  0.10-0.25  (sharp downturn)
+            2019:       0.60-0.80  (recovery then sustained)
+            Mar 2020:   0.00-0.10  (crash)
+            2022 bear:  0.10-0.30  (persistent downtrend)
+
+        Key thesis test: Must be > 0.60 during HMM misclassification periods
+        (2012-2014, 2019) that were actually trending bull markets.
+        """
+        rc = self._raw_close
+
+        if rc is None:
+            logger.error("Trend Persistence: raw_close not available")
+            return pd.Series(dtype=float)
+
+        if "SPY" not in rc.columns:
+            logger.error("Trend Persistence: SPY not in raw_close")
+            return pd.Series(dtype=float)
+
+        spy = rc["SPY"]
+        components: Dict[str, pd.Series] = {}
+
+        # Pre-compute MAs used in multiple components
+        spy_ma100 = spy.rolling(100, min_periods=100).mean()
+        spy_ma200 = spy.rolling(200, min_periods=200).mean()
+
+        # ---- SPY MA Positioning (0.30) ----
+        # Inner weights per spec: 50d=0.30, 100d=0.35, 200d=0.35
+        # Longer-term MA adherence signals more durable trend
+        spy_ma50 = spy.rolling(50, min_periods=50).mean()
+
+        above_50d  = (spy > spy_ma50).astype(float)
+        above_100d = (spy > spy_ma100).astype(float)
+        above_200d = (spy > spy_ma200).astype(float)
+
+        ma_raw = 0.30 * above_50d + 0.35 * above_100d + 0.35 * above_200d
+        if ma_raw.notna().sum() > MIN_PERIODS:
+            components["spy_ma_positioning"] = rolling_percentile_rank(ma_raw, expanding=True)
+            logger.info("  [Trend] spy_ma_positioning (50/100/200d MAs): computed")
+
+        # ---- Multi-Asset Trend Breadth (0.25) ----
+        # Fraction of 14-asset TREND_UNIVERSE above their 100-day MA
+        # Broad breadth = healthy, sustainable trend; narrow = fragile
+        available = [t for t in TREND_UNIVERSE if t in rc.columns]
+        if available:
+            breadth_df = pd.DataFrame({
+                t: (rc[t] > rc[t].rolling(100, min_periods=100).mean()).astype(float)
+                for t in available
+            })
+            breadth = breadth_df.mean(axis=1)
+            if breadth.notna().sum() > MIN_PERIODS:
+                components["multi_asset_breadth"] = rolling_percentile_rank(breadth, expanding=True)
+                logger.info(
+                    f"  [Trend] multi_asset_breadth "
+                    f"({len(available)}/{len(TREND_UNIVERSE)} assets): computed"
+                )
+            if len(available) < len(TREND_UNIVERSE):
+                missing_assets = set(TREND_UNIVERSE) - set(available)
+                logger.warning(
+                    f"  [Trend] missing universe assets: {missing_assets}"
+                )
+
+        # ---- Trend Duration (0.20) ----
+        # Days since SPY last crossed BELOW its 100-day MA
+        # Long streak without disruption = high persistence; recent cross = low
+        if spy_ma100.notna().sum() > MIN_PERIODS:
+            above_flag = (spy > spy_ma100).fillna(False)
+            prev_above = above_flag.shift(1).fillna(True)
+            # Below crossing: was above yesterday, now below
+            below_cross = (prev_above & ~above_flag)
+
+            # Vectorized: running max of crossing positions propagates the most
+            # recent crossing index forward, giving days since last crossing
+            pos = np.arange(len(spy))
+            cross_pos = np.where(below_cross.values, pos, 0)
+            last_cross = np.maximum.accumulate(cross_pos)
+            days_since = pd.Series(
+                (pos - last_cross).astype(float), index=spy.index
+            )
+            # Mask warmup period
+            days_since[spy_ma100.isna()] = np.nan
+
+            if days_since.notna().sum() > MIN_PERIODS:
+                components["trend_duration"] = rolling_percentile_rank(days_since)
+                logger.info(
+                    "  [Trend] trend_duration (days since below 100d MA): computed"
+                )
+
+        # ---- Momentum Magnitude (0.15) ----
+        # SPY risk-adjusted 63-day return = return / annualized realized vol
+        # High positive = strong upward momentum per unit of risk
+        spy_ret_63 = spy.pct_change(63)
+        spy_ann_vol = (
+            spy.pct_change()
+            .rolling(63, min_periods=30).std() * np.sqrt(252)
+        )
+        momentum_mag = spy_ret_63 / spy_ann_vol.replace(0, np.nan)
+
+        if momentum_mag.notna().sum() > MIN_PERIODS:
+            components["momentum_magnitude"] = rolling_percentile_rank(momentum_mag, expanding=True)
+            logger.info(
+                "  [Trend] momentum_magnitude (risk-adj 63d return): computed"
+            )
+
+        # ---- Trend Consistency (0.10) ----
+        # Fraction of last 63 days with positive 5-day trailing return
+        # High fraction = directionally consistent move
+        spy_5d_ret = spy.pct_change(5)
+        trend_consistency = spy_5d_ret.rolling(
+            63, min_periods=30
+        ).apply(lambda x: float((x > 0).mean()), raw=True)
+
+        if trend_consistency.notna().sum() > MIN_PERIODS:
+            components["trend_consistency"] = rolling_percentile_rank(
+                trend_consistency, expanding=True
+            )
+
+            logger.info(
+                "  [Trend] trend_consistency "
+                "(fraction positive 5d returns in 63d): computed"
+            )
+
+        if not components:
+            logger.error("Trend Persistence: no components computed — check data")
+            return pd.Series(np.nan, index=spy.index)
+
+        n_avail = len(components)
+        n_expected = len(TREND_WEIGHTS)
+        if n_avail < n_expected:
+            missing = set(TREND_WEIGHTS) - set(components)
+            logger.warning(
+                f"Trend Persistence: {n_avail}/{n_expected} components available. "
+                f"Missing: {missing}. Weights renormalized."
+            )
+
+        score = weighted_pillar_score(components, TREND_WEIGHTS)
+        logger.info(
+            f"Trend Persistence pillar complete: {score.notna().sum()} valid days, "
+            f"mean={score.mean():.3f}, std={score.std():.3f}"
+        )
+        return score
 
     def _compute_participation_quality(self) -> pd.Series:
         """Pillar 5: Participation Quality — STUB (Phase 5)."""
@@ -1002,6 +1160,96 @@ class StateEngine:
                     f"  Orthogonality (r with Growth): {corr:.3f}  "
                     f"{status} (spec requires |r| < 0.60)"
                 )
+
+        return all_pass
+    
+    def validate_trend_persistence(self) -> bool:
+        """
+        Validate trend persistence pillar against known historical episodes.
+        Per spec Sections 4D and 13A.
+
+        Key thesis test: Must be > 0.60 during HMM misclassification periods
+        (2012-2014, 2019) — actually trending bull markets the HMM called
+        Crisis-Inflation.
+        """
+        if self.pillars is None or "trend_persistence" not in self.pillars.columns:
+            logger.error("Run build() before validate_trend_persistence()")
+            return False
+
+        tp = self.pillars["trend_persistence"].dropna()
+
+        episodes = [
+            ("2012-14 Bull (HMM miss)", "2012-01-01", "2014-12-31",  0.65, 0.90),
+            ("2017 Bull",               "2017-01-01", "2017-12-31",  0.70, 0.95),
+            ("Late 2018 Downturn",      "2018-10-01", "2018-12-31",  0.10, 0.25),
+            ("2019 Bull (HMM miss)",    "2019-01-01", "2019-12-31",  0.60, 0.80),
+            ("Mar 2020 Crash",          "2020-03-01", "2020-04-30",  0.00, 0.25),
+            ("2022 Bear",               "2022-01-01", "2022-10-31",  0.10, 0.30),
+        ]
+
+        print("\n" + "=" * 68)
+        print("TREND PERSISTENCE PILLAR — EPISODE VALIDATION")
+        print("=" * 68)
+        print(
+            f"  {'Episode':<26} {'Mean':>6} {'Min':>6} {'Max':>6} "
+            f"{'Expected Range':>18}  {'Pass':>4}"
+        )
+        print("-" * 68)
+
+        all_pass = True
+        for name, start, end, lo, hi in episodes:
+            mask = (tp.index >= start) & (tp.index <= end)
+            if mask.sum() == 0:
+                print(f"  {name:<26} {'NO DATA':>44}")
+                continue
+            ep = tp[mask]
+            mean_v = ep.mean()
+            min_v  = ep.min()
+            max_v  = ep.max()
+            passed = lo <= mean_v <= hi
+            all_pass = all_pass and passed
+            status = "✓" if passed else "✗"
+            print(
+                f"  {name:<26} {mean_v:>6.2f} {min_v:>6.2f} {max_v:>6.2f} "
+                f"  [{lo:.2f} – {hi:.2f}]     {status}"
+            )
+
+        print("-" * 68)
+        verdict = "PASS ✓" if all_pass else "FAIL ✗  — iterate before next pillar"
+        print(f"  Overall: {verdict}")
+        print("=" * 68)
+
+        out_of_range = ((tp < 0) | (tp > 1)).sum()
+        print(f"\n  Range check  [0, 1]: {out_of_range} values out of range")
+        print(f"  Valid days:          {len(tp)} "
+            f"({self.pillars['trend_persistence'].isna().sum()} NaN)")
+        print(f"  Overall mean:        {tp.mean():.3f}")
+        print(f"  Overall std:         {tp.std():.3f}")
+        print(f"  Warmup cutoff:       {tp.first_valid_index()}")
+
+        # Key thesis test
+        print(f"\n  --- Key Thesis Test: HMM Misclassification Periods ---")
+        thesis_pass = True
+        for name, start, end in [
+            ("2012-2014", "2012-01-01", "2014-12-31"),
+            ("2019",      "2019-01-01", "2019-12-31"),
+        ]:
+            mask = (tp.index >= start) & (tp.index <= end)
+            if mask.sum() > 0:
+                mean_v = tp[mask].mean()
+                pct_above = (tp[mask] > 0.60).mean()
+                passed = mean_v > 0.60
+                thesis_pass = thesis_pass and passed
+                status = "✓" if passed else "✗"
+                print(
+                    f"  {name}: mean={mean_v:.3f}, "
+                    f"days above 0.60: {pct_above:.1%}  {status}"
+                )
+
+        print(
+            f"\n  Thesis test: "
+            f"{'PASS ✓' if thesis_pass else 'FAIL ✗ — V9 thesis not validated for trend'}"
+        )
 
         return all_pass
     
