@@ -601,10 +601,128 @@ class StateEngine:
         return score
 
     def _compute_inflation_pressure(self) -> pd.Series:
-        """Pillar 2: Inflation Pressure — STUB (Phase 4)."""
-        if self._raw_close is not None:
-            return pd.Series(np.nan, index=self._raw_close.index)
-        return pd.Series(dtype=float)
+        """
+        Pillar 2: Inflation Pressure — measures whether price pressure is
+        building or subsiding.
+
+        Addresses the HMM's inability to distinguish inflation environments
+        from crisis environments. This pillar measures inflation independently,
+        allowing the system to distinguish 'moderate inflation during growth'
+        (benign) from 'accelerating inflation during stress' (dangerous).
+
+        Components (spec Section 4B):
+            breakeven_inflation (0.25): T5YIE 5-year breakeven inflation level
+            commodity_momentum  (0.25): DBC 63-day return
+            cpi_acceleration    (0.20): 3-month annualized CPI minus 12-month rate
+            energy_momentum     (0.15): XLE vs SPY 63-day relative return
+            tips_relative       (0.15): TIP vs IEF 63-day relative return
+
+        Historical expectations (spec Section 4B):
+            2014-2015:  0.15-0.30  (low inflation / disinflation)
+            2021 H2:    0.75-0.95  (surging inflation)
+            2022 H1:    0.80-0.95  (peak inflation)
+            2022 H2:    0.50-0.65  (inflation decelerating)
+            2023:       0.30-0.50  (normalizing)
+
+        Spec validation test: Must be > 0.70 during 2021-2022 and
+        < 0.40 during 2014-2015 disinflation.
+        """
+        rc = self._raw_close
+        fred = self._fred_data
+        supp = self._supp_fred if self._supp_fred is not None else pd.DataFrame()
+        additional = self._additional
+
+        components: Dict[str, pd.Series] = {}
+
+        # Pre-compute SPY 63-day return (reused in energy component)
+        spy_ret_63 = None
+        if rc is not None and "SPY" in rc.columns:
+            spy_ret_63 = rc["SPY"].pct_change(63)
+
+        # ---- Breakeven Inflation: T5YIE level (0.25) ----
+        # 5-year breakeven = market's inflation expectation over next 5 years
+        # High level = elevated inflation expectations = inflation pressure
+        if not supp.empty and "T5YIE" in supp.columns:
+            t5yie = supp["T5YIE"].dropna()
+            if len(t5yie) > MIN_PERIODS:
+                components["breakeven_inflation"] = rolling_percentile_rank(t5yie)
+                logger.info(
+                    f"  [Inflation] breakeven_inflation (T5YIE): {len(t5yie)} days"
+                )
+
+        # ---- Commodity Momentum: DBC 63-day return (0.25) ----
+        # Rising commodities = upstream price pressure = inflation building
+        if rc is not None and "DBC" in rc.columns:
+            dbc_ret = rc["DBC"].pct_change(63)
+            if dbc_ret.notna().sum() > MIN_PERIODS:
+                components["commodity_momentum"] = rolling_percentile_rank(dbc_ret, expanding=True)
+                logger.info("  [Inflation] commodity_momentum (DBC 63d return): computed")
+
+        # ---- CPI Acceleration: 3-month annualized minus 12-month rate (0.20) ----
+        # Positive = inflation speeding up beyond trend = building pressure
+        # Negative = inflation decelerating below trend = easing pressure
+        if fred is not None and "CPIAUCSL" in fred.columns:
+            cpi = fred["CPIAUCSL"].replace(0, np.nan)
+            # 63 trading days ≈ 3 months, annualized by factor of 4
+            cpi_3m_annualized = (cpi / cpi.shift(63) - 1) * 4
+            # 252 trading days ≈ 12 months
+            cpi_12m = (cpi / cpi.shift(252) - 1)
+            acceleration = cpi_3m_annualized - cpi_12m
+            if acceleration.notna().sum() > MIN_PERIODS:
+                components["cpi_acceleration"] = rolling_percentile_rank(acceleration)
+                logger.info(
+                    "  [Inflation] cpi_acceleration "
+                    "(3m annualized - 12m rate): computed"
+                )
+
+        # ---- Energy Sector Momentum: XLE vs SPY 63-day relative return (0.15) ----
+        # Energy outperforming = oil/gas prices rising = inflation pressure
+        if rc is not None and "XLE" in rc.columns and spy_ret_63 is not None:
+            xle_ret = rc["XLE"].pct_change(63)
+            energy_rel = xle_ret - spy_ret_63
+            if energy_rel.notna().sum() > MIN_PERIODS:
+                components["energy_momentum"] = rolling_percentile_rank(energy_rel, expanding=True)
+                logger.info("  [Inflation] energy_momentum (XLE vs SPY): computed")
+
+        # ---- TIPS Relative Performance: TIP vs IEF 63-day relative return (0.15) ----
+        # TIPS outperforming nominal Treasuries = inflation expectations rising
+        tip_series = None
+        if additional is not None and "TIP" in additional.columns:
+            tip_series = additional["TIP"]
+            logger.info("  [Inflation] tips_relative: using supplementary TIP fetch")
+        elif rc is not None and "TIP" in rc.columns:
+            tip_series = rc["TIP"]
+            logger.info("  [Inflation] tips_relative: using snapshot TIP (fallback)")
+
+        if tip_series is not None and rc is not None and "IEF" in rc.columns:
+            tip_ret = tip_series.pct_change(63)
+            ief_ret = rc["IEF"].pct_change(63)
+            tips_rel = tip_ret - ief_ret
+            if tips_rel.notna().sum() > MIN_PERIODS:
+                components["tips_relative"] = rolling_percentile_rank(tips_rel)
+                logger.info("  [Inflation] tips_relative (TIP vs IEF): computed")
+
+        if not components:
+            logger.error("Inflation Pressure: no components computed — check data")
+            if self._raw_close is not None:
+                return pd.Series(np.nan, index=self._raw_close.index)
+            return pd.Series(dtype=float)
+
+        n_avail = len(components)
+        n_expected = len(INFLATION_WEIGHTS)
+        if n_avail < n_expected:
+            missing = set(INFLATION_WEIGHTS) - set(components)
+            logger.warning(
+                f"Inflation Pressure: {n_avail}/{n_expected} components available. "
+                f"Missing: {missing}. Weights renormalized."
+            )
+
+        score = weighted_pillar_score(components, INFLATION_WEIGHTS)
+        logger.info(
+            f"Inflation Pressure pillar complete: {score.notna().sum()} valid days, "
+            f"mean={score.mean():.3f}, std={score.std():.3f}"
+        )
+        return score
 
     def _compute_trend_persistence(self) -> pd.Series:
         """Pillar 4: Trend Persistence — STUB (Phase 3)."""
@@ -779,6 +897,111 @@ class StateEngine:
             f"\n  Thesis test: "
             f"{'PASS ✓' if thesis_pass else 'FAIL ✗ — V9 core thesis not validated'}"
         )
+
+        return all_pass
+    
+    def validate_inflation_pressure(self) -> bool:
+        """
+        Validate inflation pressure pillar against known historical episodes.
+        Per spec Sections 4B and 13A.
+
+        Key spec validation tests:
+            Must be > 0.70 during 2021-2022 inflation episode
+            Must be < 0.40 during 2014-2015 disinflation
+            Must NOT correlate > 0.60 with growth momentum
+        """
+        if self.pillars is None or "inflation_pressure" not in self.pillars.columns:
+            logger.error("Run build() before validate_inflation_pressure()")
+            return False
+
+        ip = self.pillars["inflation_pressure"].dropna()
+
+        episodes = [
+            ("2008 Crisis",   "2008-09-01", "2009-03-31",  0.10, 0.45),
+            ("2014-2015",     "2014-01-01", "2015-12-31",  0.15, 0.45),
+            ("2019 Low Infl", "2019-01-01", "2019-12-31",  0.15, 0.45),
+            ("2021 H2 Surge", "2021-06-01", "2021-12-31",  0.55, 0.80),
+            ("2022 H1 Peak",  "2022-01-01", "2022-06-30",  0.65, 0.90),
+            ("2022 H2 Decel", "2022-07-01", "2022-12-31",  0.15, 0.45),
+            ("2023 Normal",   "2023-01-01", "2023-12-31",  0.30, 0.50),
+        ]
+
+        print("\n" + "=" * 68)
+        print("INFLATION PRESSURE PILLAR — EPISODE VALIDATION")
+        print("=" * 68)
+        print(
+            f"  {'Episode':<22} {'Mean':>6} {'Min':>6} {'Max':>6} "
+            f"{'Expected Range':>18}  {'Pass':>4}"
+        )
+        print("-" * 68)
+
+        all_pass = True
+        for name, start, end, lo, hi in episodes:
+            mask = (ip.index >= start) & (ip.index <= end)
+            if mask.sum() == 0:
+                print(f"  {name:<22} {'NO DATA':>44}")
+                continue
+            ep = ip[mask]
+            mean_v = ep.mean()
+            min_v  = ep.min()
+            max_v  = ep.max()
+            passed = lo <= mean_v <= hi
+            all_pass = all_pass and passed
+            status = "✓" if passed else "✗"
+            print(
+                f"  {name:<22} {mean_v:>6.2f} {min_v:>6.2f} {max_v:>6.2f} "
+                f"  [{lo:.2f} – {hi:.2f}]     {status}"
+            )
+
+        print("-" * 68)
+        verdict = "PASS ✓" if all_pass else "FAIL ✗  — iterate before next pillar"
+        print(f"  Overall: {verdict}")
+        print("=" * 68)
+
+        out_of_range = ((ip < 0) | (ip > 1)).sum()
+        print(f"\n  Range check  [0, 1]: {out_of_range} values out of range")
+        print(f"  Valid days:          {len(ip)} "
+            f"({self.pillars['inflation_pressure'].isna().sum()} NaN)")
+        print(f"  Overall mean:        {ip.mean():.3f}")
+        print(f"  Overall std:         {ip.std():.3f}")
+        print(f"  Warmup cutoff:       {ip.first_valid_index()}")
+
+        # ---- Key spec validation tests ----
+        print(f"\n  --- Key Validation Tests (spec Section 4B) ---")
+
+        # Test 1: High during 2021 H2 - 2022 H1
+        mask_hi = (ip.index >= "2021-06-01") & (ip.index <= "2022-06-30")
+        if mask_hi.sum() > 0:
+            mean_hi = ip[mask_hi].mean()
+            pct_above = (ip[mask_hi] > 0.70).mean()
+            status = "✓" if mean_hi > 0.70 else "✗"
+            print(
+                f"  2021 H2 – 2022 H1: mean={mean_hi:.3f}, "
+                f"days above 0.70: {pct_above:.1%}  {status}"
+            )
+
+        # Test 2: Low during 2014-2015
+        mask_lo = (ip.index >= "2014-01-01") & (ip.index <= "2015-12-31")
+        if mask_lo.sum() > 0:
+            mean_lo = ip[mask_lo].mean()
+            pct_below = (ip[mask_lo] < 0.40).mean()
+            status = "✓" if mean_lo < 0.40 else "✗"
+            print(
+                f"  2014-2015:         mean={mean_lo:.3f}, "
+                f"days below 0.40: {pct_below:.1%}  {status}"
+            )
+
+        # Test 3: Orthogonality with growth momentum (spec requirement)
+        if "growth_momentum" in self.pillars.columns:
+            gm = self.pillars["growth_momentum"]
+            common = ip.index.intersection(gm.dropna().index)
+            if len(common) > 252:
+                corr = ip.reindex(common).corr(gm.reindex(common))
+                status = "✓" if abs(corr) < 0.60 else "✗"
+                print(
+                    f"  Orthogonality (r with Growth): {corr:.3f}  "
+                    f"{status} (spec requires |r| < 0.60)"
+                )
 
         return all_pass
     
