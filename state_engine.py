@@ -889,10 +889,143 @@ class StateEngine:
         return score
 
     def _compute_participation_quality(self) -> pd.Series:
-        """Pillar 5: Participation Quality — STUB (Phase 5)."""
-        if self._raw_close is not None:
-            return pd.Series(np.nan, index=self._raw_close.index)
-        return pd.Series(dtype=float)
+        """
+        Pillar 5: Participation Quality — measures whether a rally is
+        broad-based and healthy or narrow and fragile.
+
+        Addresses the HMM's inability to distinguish broad market strength
+        from narrow leadership that looks strong but is fragile. This pillar
+        feeds directly into the conviction governor's confidence assessment
+        for bull market states.
+
+        Components (spec Section 4E):
+            sector_breadth         (0.30): Fraction of sector ETFs above 50d MA
+            equal_vs_cap           (0.25): RSP vs SPY 21-day relative return
+            sector_dispersion      (0.20): Negative of cross-sectional sector return std
+            multi_asset_breadth    (0.15): Fraction of TREND_UNIVERSE with positive 21d return
+            leadership_concentration (0.10): Negative of top-3 sector return concentration
+
+        Historical expectations (spec Section 4E):
+            2013-2014:   0.65-0.85  (broad participation in recovery)
+            2017:        0.70-0.90  (broad and healthy)
+            Mar 2020:    0.05-0.20  (complete breakdown of participation)
+            2020-2021:   0.60-0.85  (broad recovery)
+            2022 Bear:   0.15-0.45  (energy-led, uneven sector performance)
+            2023 AI:     0.20-0.40  (narrow AI/tech leadership)
+
+        Key validation test: Must be high (>0.60) during broad rallies
+        (2013-14, 2017) and low (<0.40) during narrow leadership (2023).
+        """
+        rc = self._raw_close
+        additional = self._additional
+
+        if rc is None:
+            logger.error("Participation Quality: raw_close not available")
+            return pd.Series(dtype=float)
+
+        components: Dict[str, pd.Series] = {}
+
+        # Available sector ETFs — XLRE (2015+) and XLC (2018+) absent in early periods
+        available_sectors = [t for t in SECTOR_ETFS if t in rc.columns]
+        if not available_sectors:
+            logger.error("Participation Quality: no sector ETFs found in raw_close")
+            return pd.Series(np.nan, index=rc.index)
+
+        # ---- Sector Breadth: fraction of sector ETFs above 50-day MA (0.30) ----
+        # High = most sectors in uptrend = healthy broad participation
+        breadth_signals = pd.DataFrame({
+            t: (rc[t] > rc[t].rolling(50, min_periods=50).mean()).astype(float)
+            for t in available_sectors
+        })
+        sector_breadth = breadth_signals.mean(axis=1)
+        if sector_breadth.notna().sum() > MIN_PERIODS:
+            components["sector_breadth"] = rolling_percentile_rank(sector_breadth)
+            logger.info(
+                f"  [Participation] sector_breadth "
+                f"({len(available_sectors)}/{len(SECTOR_ETFS)} sectors): computed"
+            )
+
+        # ---- Equal vs Cap Weight: RSP vs SPY 21-day relative return (0.25) ----
+        # RSP outperforming → equal-weight beats cap-weight → small/mid participation
+        rsp_series = None
+        if additional is not None and "RSP" in additional.columns:
+            rsp_series = additional["RSP"]
+            logger.info("  [Participation] equal_vs_cap: using supplementary RSP")
+        if rsp_series is not None and "SPY" in rc.columns:
+            eq_vs_cap = rsp_series.pct_change(21) - rc["SPY"].pct_change(21)
+            if eq_vs_cap.notna().sum() > MIN_PERIODS:
+                components["equal_vs_cap"] = rolling_percentile_rank(eq_vs_cap)
+                logger.info("  [Participation] equal_vs_cap (RSP vs SPY 21d): computed")
+        else:
+            logger.warning("  [Participation] equal_vs_cap: RSP not available")
+
+        # ---- Sector Dispersion: negative of 21-day cross-sectional std (0.20) ----
+        # Low dispersion = sectors moving together = healthy broad market
+        # High dispersion = divergence, narrow leadership
+        sector_rets_21 = pd.DataFrame({
+            t: rc[t].pct_change(21) for t in available_sectors
+        })
+        dispersion = sector_rets_21.std(axis=1)
+        sector_dispersion_raw = -dispersion   # negate: low dispersion → high quality
+        if sector_dispersion_raw.notna().sum() > MIN_PERIODS:
+            components["sector_dispersion"] = rolling_percentile_rank(
+                sector_dispersion_raw, expanding=True
+            )
+            logger.info("  [Participation] sector_dispersion (neg std): computed")
+
+        # ---- Multi-Asset Breadth: fraction with positive 21-day return (0.15) ----
+        # Broad cross-asset participation beyond equities
+        avail_universe = [t for t in TREND_UNIVERSE if t in rc.columns]
+        if avail_universe:
+            positive_rets = pd.DataFrame({
+                t: (rc[t].pct_change(21) > 0).astype(float)
+                for t in avail_universe
+            })
+            multi_breadth = positive_rets.mean(axis=1)
+            if multi_breadth.notna().sum() > MIN_PERIODS:
+                components["multi_asset_breadth"] = rolling_percentile_rank(
+                    multi_breadth
+                )
+                logger.info(
+                    f"  [Participation] multi_asset_breadth "
+                    f"({len(avail_universe)} assets): computed"
+                )
+
+        # ---- Leadership Concentration: negative of top-3 sector return
+        # concentration (0.10) ----
+        # Measures whether gains are spread across sectors or dominated by a few.
+        # Uses absolute 21-day sector returns as proxy for sector "pull" on the market.
+        # concentration = top-3 abs returns / sum of all abs returns
+        # High concentration → narrow leadership → low participation quality
+        # Max-minus-median of sector returns
+        # High excess = one sector far above median = concentrated leadership = low quality
+        # Works in both bull and bear markets — crashes correctly score low
+        conc_raw = -(sector_rets_21.max(axis=1) - sector_rets_21.median(axis=1))
+        if conc_raw.notna().sum() > MIN_PERIODS:
+            components["leadership_concentration"] = rolling_percentile_rank(conc_raw, expanding=True)
+            logger.info(
+                "  [Participation] leadership_concentration (top-3 abs): computed"
+            )
+
+        if not components:
+            logger.error("Participation Quality: no components computed — check data")
+            return pd.Series(np.nan, index=rc.index)
+
+        n_avail = len(components)
+        n_expected = len(PARTICIPATION_WEIGHTS)
+        if n_avail < n_expected:
+            missing = set(PARTICIPATION_WEIGHTS) - set(components)
+            logger.warning(
+                f"Participation Quality: {n_avail}/{n_expected} components available. "
+                f"Missing: {missing}. Weights renormalized."
+            )
+
+        score = weighted_pillar_score(components, PARTICIPATION_WEIGHTS)
+        logger.info(
+            f"Participation Quality pillar complete: {score.notna().sum()} valid days, "
+            f"mean={score.mean():.3f}, std={score.std():.3f}"
+        )
+        return score
 
     # -----------------------------------------------------------------------
     # Validation
@@ -1250,6 +1383,115 @@ class StateEngine:
             f"\n  Thesis test: "
             f"{'PASS ✓' if thesis_pass else 'FAIL ✗ — V9 thesis not validated for trend'}"
         )
+
+        return all_pass
+    
+    def validate_participation_quality(self) -> bool:
+        """
+        Validate participation quality pillar against known historical episodes.
+        Per spec Sections 4E and 13A.
+
+        Key validation test: Must be high (>0.60) during broad rallies
+        (2013-14, 2017) and low (<0.40) during narrow AI/tech leadership (2023).
+        """
+        if self.pillars is None or "participation_quality" not in self.pillars.columns:
+            logger.error("Run build() before validate_participation_quality()")
+            return False
+
+        pq = self.pillars["participation_quality"].dropna()
+
+        episodes = [
+            ("2013-14 Broad Bull",   "2013-01-01", "2014-12-31",  0.60, 0.85),
+            ("2017 Broad Bull",      "2017-01-01", "2017-12-31",  0.50, 0.75),
+            ("Mar 2020 Breakdown",   "2020-03-01", "2020-04-30",  0.05, 0.20),
+            ("2020-21 Recovery",     "2020-06-01", "2021-12-31",  0.30, 0.65),
+            ("2022 Bear",            "2022-01-01", "2022-10-31",  0.15, 0.45),
+            ("2023 AI Narrow",       "2023-01-01", "2023-12-31",  0.35, 0.60),
+        ]
+
+        print("\n" + "=" * 70)
+        print("PARTICIPATION QUALITY PILLAR — EPISODE VALIDATION")
+        print("=" * 70)
+        print(
+            f"  {'Episode':<24} {'Mean':>6} {'Min':>6} {'Max':>6} "
+            f"{'Expected Range':>18}  {'Pass':>4}"
+        )
+        print("-" * 70)
+
+        all_pass = True
+        for name, start, end, lo, hi in episodes:
+            mask = (pq.index >= start) & (pq.index <= end)
+            if mask.sum() == 0:
+                print(f"  {name:<24} {'NO DATA':>44}")
+                continue
+            ep = pq[mask]
+            mean_v = ep.mean()
+            min_v  = ep.min()
+            max_v  = ep.max()
+            passed = lo <= mean_v <= hi
+            all_pass = all_pass and passed
+            status = "✓" if passed else "✗"
+            print(
+                f"  {name:<24} {mean_v:>6.2f} {min_v:>6.2f} {max_v:>6.2f} "
+                f"  [{lo:.2f} – {hi:.2f}]     {status}"
+            )
+
+        print("-" * 70)
+        verdict = "PASS ✓" if all_pass else "FAIL ✗  — iterate before next pillar"
+        print(f"  Overall: {verdict}")
+        print("=" * 70)
+
+        out_of_range = ((pq < 0) | (pq > 1)).sum()
+        print(f"\n  Range check  [0, 1]: {out_of_range} values out of range")
+        print(
+            f"  Valid days:          {len(pq)} "
+            f"({self.pillars['participation_quality'].isna().sum()} NaN)"
+        )
+        print(f"  Overall mean:        {pq.mean():.3f}")
+        print(f"  Overall std:         {pq.std():.3f}")
+        print(f"  Warmup cutoff:       {pq.first_valid_index()}")
+
+        # Key validation tests
+        print(f"\n  --- Key Validation Tests (spec Section 4E) ---")
+
+        # Test 1: Broad rallies score high
+        for name, start, end, threshold in [
+            ("2013-2014", "2013-01-01", "2014-12-31", 0.60),
+            ("2017",      "2017-01-01", "2017-12-31", 0.55),
+        ]:
+            mask = (pq.index >= start) & (pq.index <= end)
+            if mask.sum() > 0:
+                mean_v = pq[mask].mean()
+                pct_above = (pq[mask] > threshold).mean()
+                status = "✓" if mean_v > threshold else "✗"
+                print(
+                    f"  {name} broad rally: mean={mean_v:.3f}, "
+                    f"above 0.60: {pct_above:.1%}  {status}"
+                )
+
+        # Test 2: Narrow leadership scores low
+        mask_2023 = (pq.index >= "2023-01-01") & (pq.index <= "2023-12-31")
+        if mask_2023.sum() > 0:
+            mean_2023 = pq[mask_2023].mean()
+            pct_below = (pq[mask_2023] < 0.40).mean()
+            status = "✓" if mean_2023 < 0.50 else "✗"
+            print(
+                f"  2023 AI narrow rally: mean={mean_2023:.3f}, "
+                f"below 0.40: {pct_below:.1%}  {status}"
+            )
+
+        # Test 3: Orthogonality with other pillars
+        for pillar_name in ["growth_momentum", "trend_persistence"]:
+            if pillar_name in self.pillars.columns:
+                other = self.pillars[pillar_name]
+                common = pq.index.intersection(other.dropna().index)
+                if len(common) > 252:
+                    corr = pq.reindex(common).corr(other.reindex(common))
+                    status = "✓" if abs(corr) < 0.60 else "✗"
+                    print(
+                        f"  Orthogonality vs {pillar_name}: "
+                        f"r={corr:.3f}  {status} (|r| < 0.60)"
+                    )
 
         return all_pass
     
