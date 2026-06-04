@@ -32,6 +32,7 @@ import os
 from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
+from trajectory import TrajectoryEngine
 
 logger = logging.getLogger("spy_alpha_v9.state_engine")
 
@@ -250,6 +251,17 @@ class StateEngine:
             valid = self.pillars[col].notna().sum()
             first = self.pillars[col].first_valid_index()
             logger.info(f"  {col}: {valid} valid days, first valid: {first}")
+
+        # ---- Step 3: Trajectory features ----
+        logger.info("Building trajectory features...")
+        _traj = TrajectoryEngine()
+        self.trajectory_features = _traj.build(self.pillars)
+        self.state_vector = _traj.state_vector(self.pillars)
+        self.trajectory_engine = _traj
+        logger.info(
+            f"State vector ready: 25 dimensions, "
+            f"{self.state_vector.notna().all(axis=1).sum()} complete rows"
+        )
 
         return self.pillars
 
@@ -1494,5 +1506,15 @@ class StateEngine:
                     )
 
         return all_pass
+    
+    def validate_trajectory(self) -> bool:
+        """
+        Validate trajectory features. Delegates to TrajectoryEngine.validate().
+        Per spec Section 5.
+        """
+        if not hasattr(self, "trajectory_engine") or self.trajectory_engine is None:
+            logger.error("Run build() before validate_trajectory()")
+            return False
+        return self.trajectory_engine.validate(self.pillars)
     
     
