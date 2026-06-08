@@ -238,22 +238,26 @@ class StateAllocator:
  
     def __init__(
         self,
-        n_top:          int   = N_TOP,
-        min_train:      int   = MIN_TRAIN,
-        refit_every:    int   = REFIT_EVERY,
-        forward_window: int   = FORWARD_WINDOW,
-        lgb_params:     Optional[Dict[str, Any]] = None,
+        n_top: int = N_TOP,
+        min_train: int = MIN_TRAIN,
+        refit_every: int = REFIT_EVERY,
+        forward_window: int = FORWARD_WINDOW,
+        lgb_params: Optional[Dict[str, Any]] = None,
+        target_type: str = "excess_return",
+        weighting_type: str = "inverse_vol",
     ) -> None:
         if not LGB_AVAILABLE:
             raise ImportError(
                 "lightgbm required. "
                 "pip install lightgbm --break-system-packages"
             )
-        self.n_top          = n_top
-        self.min_train      = min_train
-        self.refit_every    = refit_every
+        self.n_top = n_top
+        self.min_train = min_train
+        self.refit_every = refit_every
         self.forward_window = forward_window
-        self.lgb_params     = lgb_params or DEFAULT_LGB_PARAMS.copy()
+        self.lgb_params = lgb_params or DEFAULT_LGB_PARAMS.copy()
+        self.target_type = target_type    # "tail_aware" | "raw_return" | "excess_return"
+        self.weighting_type = weighting_type  # "inverse_vol" | "score_prop"
  
         # Populated by build()
         self.predictions:   Optional[Dict[str, pd.DataFrame]] = None
@@ -410,12 +414,61 @@ class StateAllocator:
                 if asset not in daily_ret.columns:
                     continue
                 p_win = daily_ret[asset].iloc[i:end_i]
-                r = compute_tail_aware_reward(p_win, s_win, turnover=0.0)
-                if not np.isnan(r):
+                r = self._compute_single_target(p_win, s_win)
+                if r is not None and not np.isnan(r):
                     reward_dict[asset][date] = r
  
         return pd.DataFrame(reward_dict)
  
+    # ---------------------------------------------------------------- #
+    # Private: single-window target computation                         #
+    # ---------------------------------------------------------------- #
+
+    def _compute_single_target(
+        self,
+        asset_returns: pd.Series,
+        spy_returns: pd.Series,
+    ) -> Optional[float]:
+        """
+        Compute a single target value for one (date, asset) window.
+
+        Dispatches on self.target_type:
+            "tail_aware"    — original V8 meta-allocator reward (portfolio-level)
+            "raw_return"    — annualized forward return (V8 return_forecaster style)
+            "excess_return" — annualized forward excess return vs SPY
+        """
+        if self.target_type == "tail_aware":
+            r = compute_tail_aware_reward(asset_returns, spy_returns, turnover=0.0)
+            return float(r) if not np.isnan(r) else None
+
+        port = asset_returns.dropna()
+        if len(port) < 21:
+            return None
+
+        scale = 252.0 / len(port)
+
+        if self.target_type == "raw_return":
+            total_ret = float((1.0 + port).prod() - 1.0)
+            return total_ret * scale
+
+        if self.target_type == "excess_return":
+            # spy_returns has integer index from numpy slice;
+            # port has DatetimeIndex — reindex by label fails silently.
+            # Use values directly and mask NaN by position.
+            a_arr = asset_returns.values
+            s_arr = spy_returns.values
+            valid   = ~(np.isnan(a_arr) | np.isnan(s_arr))
+            a_clean = a_arr[valid]
+            s_clean = s_arr[valid]
+            if len(a_clean) < 21:
+                return None
+            scale_adj = 252.0 / len(a_clean)
+            asset_ret = float((1.0 + a_clean).prod() - 1.0)
+            spy_ret   = float((1.0 + s_clean).prod() - 1.0)
+            return (asset_ret - spy_ret) * scale_adj
+
+        return None
+
     # ---------------------------------------------------------------- #
     # Private: asset features                                            #
     # ---------------------------------------------------------------- #
@@ -654,11 +707,17 @@ class StateAllocator:
                 else:
                     vols[asset] = 0.02
  
-            # Raw weight = max(score, ε) / vol
-            raw_w: Dict[str, float] = {
-                a: max(float(valid[a]), MIN_WEIGHT_EPS) / vols[a]
-                for a in top_assets
-            }
+            # Raw weight based on weighting_type
+            if self.weighting_type == "inverse_vol":
+                raw_w: Dict[str, float] = {
+                    a: max(float(valid[a]), MIN_WEIGHT_EPS) / vols[a]
+                    for a in top_assets
+                }
+            else:  # score_prop: weight proportional to predicted score only
+                raw_w: Dict[str, float] = {
+                    a: max(float(valid[a]), MIN_WEIGHT_EPS)
+                    for a in top_assets
+                }
  
             # Initial normalization
             total = sum(raw_w.values())
