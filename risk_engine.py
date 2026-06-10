@@ -237,126 +237,65 @@ UNCERTAINTY_WEIGHTS: Dict[str, float] = {
  
  
 def compute_uncertainty_score(
-    state_features: pd.DataFrame,
-    strategy_weights: Dict[str, Dict[str, float]],
-    allocator_confidence: Optional[float] = None,
+    analog_scores_row: Dict[str, float],
+    strategy_weights:  Dict[str, Dict[str, float]],
 ) -> Tuple[float, Dict[str, float]]:
     """
-    Compute the composite uncertainty score from multiple signals.
- 
-    This is the most important risk innovation in v8. When the system
-    doesn't know what's happening, it gets conservative.
- 
-    Args:
-        state_features: Single row (or latest row) from state representation
-        strategy_weights: {strategy_name: {asset: weight}} — proposed weights
-        allocator_confidence: Meta-allocator's self-reported confidence
- 
-    Returns:
-        uncertainty_score in [0, 1] and component breakdown
+    V9 uncertainty score — 3 components from analog memory + strategy disagreement.
+
+    V9 changes from V8:
+        Removed: regime_instability      (HMM entropy — no HMM in V9)
+        Removed: observable_latent_divergence (vol vs HMM — no HMM in V9)
+        Removed: allocator_low_confidence (no meta-allocator in V9)
+        Removed: embedding_drift          (placeholder)
+        Removed: transition_hazard        (already in governor dampener + fast layer —
+                                           adding it here creates a 4th pathway from
+                                           the same variable)
+        Added:   coherence from AnalogMemory  (0.40 weight)
+        Added:   reliability from AnalogMemory (0.35 weight)
+
+    Components:
+        coherence_uncertainty  = 1 - coherence   (low agreement  = uncertain)
+        reliability_uncertainty = 1 - reliability (poor track record = uncertain)
+        strategy_disagreement                     (S1/S2/S3 disagree = uncertain)
     """
-    components = {}
- 
-    # ---- Strategy Disagreement ----
-    # High variance in proposed weights across strategies
+    components: Dict[str, float] = {}
+
+    def _safe(v: Any, default: float = 0.5) -> float:
+        if v is None:
+            return default
+        f = float(v)
+        return default if np.isnan(f) else f
+
+    # ---- Coherence (0.40) ----
+    coherence = _safe(analog_scores_row.get("coherence"), 0.5)
+    components["coherence_uncertainty"] = float(np.clip(1.0 - coherence, 0.0, 1.0))
+
+    # ---- Reliability (0.35) ----
+    reliability = _safe(analog_scores_row.get("reliability"), 0.5)
+    components["reliability_uncertainty"] = float(np.clip(1.0 - reliability, 0.0, 1.0))
+
+    # ---- Strategy disagreement (0.25) ----
     if len(strategy_weights) >= 2:
-        all_assets = set()
+        all_assets: set = set()
         for w in strategy_weights.values():
             all_assets.update(w.keys())
- 
-        weight_vectors = []
-        for name, w in strategy_weights.items():
-            vec = [w.get(a, 0.0) for a in sorted(all_assets)]
-            weight_vectors.append(vec)
- 
-        weight_array = np.array(weight_vectors)
-        # Average standard deviation across assets
-        disagreement = np.mean(np.std(weight_array, axis=0))
-        # Scale: 0 std → 0, 0.3 std → 1
-        components["strategy_disagreement"] = min(disagreement / 0.3, 1.0)
+        vecs = [
+            [w.get(a, 0.0) for a in sorted(all_assets)]
+            for w in strategy_weights.values()
+        ]
+        disagreement = float(np.mean(np.std(np.array(vecs), axis=0)))
+        components["strategy_disagreement"] = float(np.clip(disagreement / 0.30, 0.0, 1.0))
     else:
         components["strategy_disagreement"] = 0.0
- 
-    # ---- Regime Instability ----
-    # High entropy in HMM probability distribution
-    if isinstance(state_features, pd.DataFrame):
-        row = state_features.iloc[-1] if len(state_features) > 1 else state_features.iloc[0]
-    else:
-        row = state_features
- 
-    entropy = row.get("hmm_regime_entropy", None)
-    if entropy is not None and not pd.isna(entropy):
-        # Max entropy for 5 regimes = ln(5) ≈ 1.609
-        # Normalize: entropy/max_entropy
-        max_entropy = np.log(5)
-        components["regime_instability"] = min(float(entropy) / max_entropy, 1.0)
-    else:
-        components["regime_instability"] = 0.5  # uncertain when no data
- 
-    # ---- Transition Acceleration ----
-    # Rapidly changing transition features
-    trans_cols = [c for c in row.index if c.startswith("trans_")]
-    if trans_cols:
-        trans_vals = []
-        for col in trans_cols:
-            val = row.get(col, None)
-            if val is not None and not pd.isna(val):
-                trans_vals.append(abs(float(val)))
- 
-        if trans_vals:
-            # Average absolute transition velocity
-            mean_accel = np.mean(trans_vals)
-            # Scale: this is domain-dependent, use percentile-like mapping
-            # Higher mean acceleration → higher uncertainty
-            components["transition_acceleration"] = min(mean_accel / 0.05, 1.0)
-        else:
-            components["transition_acceleration"] = 0.0
-    else:
-        components["transition_acceleration"] = 0.0
- 
-    # ---- Allocator Low Confidence ----
-    if allocator_confidence is not None:
-        # Invert: low confidence → high uncertainty
-        components["allocator_low_confidence"] = 1.0 - min(max(allocator_confidence, 0), 1)
-    else:
-        components["allocator_low_confidence"] = 0.5
- 
-    # ---- Observable-Latent Divergence ----
-    # Observable states say one thing, latent states say another
-    # Use vol regime vs HMM: if vol is low but HMM says crisis, divergence is high
-    vol_10d = row.get("vol_realized_10d", None)
-    hmm_max = row.get("hmm_max_prob", None)
-    hmm_entropy_val = row.get("hmm_regime_entropy", None)
- 
-    if vol_10d is not None and hmm_entropy_val is not None and not pd.isna(vol_10d) and not pd.isna(hmm_entropy_val):
-        # Low vol + high regime entropy = divergence
-        # High vol + low regime entropy = agreement
-        vol_calm = max(1.0 - float(vol_10d) / 0.30, 0)  # 0 at 30% vol, 1 at 0% vol
-        regime_confused = float(hmm_entropy_val) / np.log(5)
-        divergence = vol_calm * regime_confused
-        components["observable_latent_divergence"] = min(divergence, 1.0)
-    else:
-        components["observable_latent_divergence"] = 0.0
- 
-    # ---- Embedding Drift ----
-    # Placeholder until deep embeddings are implemented (Step 7)
-    # When embeddings exist, this measures large change in embedding values
-    components["embedding_drift"] = 0.0
- 
-    # ---- Compute weighted uncertainty score ----
-    score = 0.0
-    total_weight = 0.0
-    for signal, weight in UNCERTAINTY_WEIGHTS.items():
-        if signal in components:
-            score += weight * components[signal]
-            total_weight += weight
- 
-    if total_weight > 0:
-        score /= total_weight
- 
-    score = min(max(score, 0.0), 1.0)
- 
-    return score, components
+
+    # ---- Weighted composite ----
+    score = (
+        0.40 * components["coherence_uncertainty"]
+        + 0.35 * components["reliability_uncertainty"]
+        + 0.25 * components["strategy_disagreement"]
+    )
+    return float(np.clip(score, 0.0, 1.0)), components
  
  
 def compute_uncertainty_series(
@@ -472,13 +411,13 @@ class RiskEngine:
  
     def apply(
         self,
-        proposed_weights: Dict[str, float],
-        strategy_weights: Dict[str, Dict[str, float]],
-        state_features: pd.DataFrame,
-        spy_prices: pd.Series,
-        current_date: pd.Timestamp,
-        stress_score: float = 0.0,
-        allocator_confidence: Optional[float] = None,
+        proposed_weights:  Dict[str, float],
+        strategy_weights:  Dict[str, Dict[str, float]],
+        analog_scores_row: Dict[str, float],
+        spy_prices:        pd.Series,
+        current_date:      pd.Timestamp,
+        stress_score:      float = 0.0,
+        dynamic_max_upro:  Optional[float] = None,
     ) -> Tuple[Dict[str, float], Dict[str, Any]]:
         """
         Apply the full risk constraint pipeline to a proposed portfolio.
@@ -505,7 +444,7 @@ class RiskEngine:
         """
         # ---- Step 1: Compute uncertainty ----
         uncertainty, unc_components = compute_uncertainty_score(
-            state_features, strategy_weights, allocator_confidence
+            analog_scores_row, strategy_weights
         )
         self.last_uncertainty_score = uncertainty
         self.last_uncertainty_components = unc_components
@@ -521,7 +460,8 @@ class RiskEngine:
 
         # ---- Step 3b: Apply leverage scaling ----
         weights = self._apply_leverage_scaling(
-            weights, uncertainty, stress_score, active
+            weights, uncertainty, stress_score, active,
+            dynamic_max_upro=dynamic_max_upro,
         )
 
         # ---- Step 4: Enforce hard constraints ----
@@ -550,7 +490,7 @@ class RiskEngine:
                 "max_turnover": active["max_turnover_per_rebalance"],
             },
             "leverage_adjustment": self._compute_leverage_adjustment(
-                uncertainty, allocator_confidence
+                uncertainty, None
             ),
         }
  
@@ -681,10 +621,11 @@ class RiskEngine:
  
     def _apply_leverage_scaling(
         self,
-        weights: Dict[str, float],
-        uncertainty: float,
-        stress_score: float,
+        weights:            Dict[str, float],
+        uncertainty:        float,
+        stress_score:       float,
         active_constraints: Dict[str, Any],
+        dynamic_max_upro:   Optional[float] = None,
     ) -> Dict[str, float]:
         """
         Scale UPRO allocation based on risk conditions.
@@ -698,8 +639,9 @@ class RiskEngine:
         """
         scaled = weights.copy()
 
-        # Only scale UPRO if it exists in the portfolio
-        if "UPRO" not in scaled or scaled["UPRO"] < 0.001:
+        # V9 gate: risk engine scales UPRO, never injects it.
+        # If S1 did not select UPRO (< 1%), we do not override that decision.
+        if "UPRO" not in scaled or scaled["UPRO"] < 0.01:
             return scaled
 
         # ---- Conditions for leverage scaling ----
@@ -721,10 +663,12 @@ class RiskEngine:
         intensity = max(intensity, 0)
 
         # ---- Target UPRO weight ----
-        # Scale from current weight toward a target based on intensity
-        # At full intensity, target is the constraint ceiling * 0.6
-        max_upro = active_constraints.get("max_upro_weight", 0.45)
-        ceiling = self.profile.get("upro_scaling_ceiling", 0.60)
+        # V9: use dynamic_max_upro from ConvictionGovernor if provided.
+        # The governor sets the ceiling based on conviction_budget;
+        # the risk engine scales toward that ceiling when conditions are favorable.
+        max_upro    = dynamic_max_upro if dynamic_max_upro is not None \
+                      else active_constraints.get("max_upro_weight", 0.45)
+        ceiling     = self.profile.get("upro_scaling_ceiling", 0.60)
         target_upro = max_upro * ceiling * intensity
 
         # Only scale UP, never down

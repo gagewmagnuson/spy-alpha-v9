@@ -450,6 +450,10 @@ class MultiHorizonCoordinator:
         # Exposure diagnostics storage
         self._diag_records: List[Dict] = []
 
+        # Risk engine (Step 8 integration)
+        from risk_engine import RiskEngine
+        self._risk_engine = RiskEngine(profile=profile)
+
     def process(
         self,
         strategy_portfolios: Dict[str, Dict[str, float]],
@@ -458,27 +462,37 @@ class MultiHorizonCoordinator:
         current_date:        pd.Timestamp,
         trading_index:       pd.DatetimeIndex,
         transition_hazard:   float = 0.0,
+        analog_scores_row:   Optional[Dict[str, float]] = None,
         force_slow_update:   bool  = False,
         force_medium_update: bool  = False,
     ) -> Tuple[Dict[str, float], Dict[str, Any]]:
         """
-        Process strategy portfolios through all three temporal layers.
+        Process strategy portfolios through all four temporal layers.
 
-        Args:
-            strategy_portfolios : {"s1": {asset: w}, "s2": {...}, "s3": {...}}
-            slow_composite      : pre-computed 63-day smoothed composite value
-            spy_prices          : SPY price series
-            current_date        : date being processed
-            trading_index       : full trading day index (for frequency counting)
-            transition_hazard   : from AnalogMemory (percentile-ranked [0,1])
-            force_slow_update   : force slow layer recompute
-            force_medium_update : force medium layer recompute
+        V9 Step 8 addition: risk engine runs between medium and fast layers.
+        Governor output hoisted to top of method so it can be used by both
+        the medium layer and the risk engine without a second call.
         """
         metadata: Dict[str, Any] = {
             "slow_layer":   {},
             "medium_layer": {},
+            "risk_engine":  {},
             "fast_layer":   {},
         }
+
+        # ----------------------------------------------------------------
+        # Governor output (hoisted — used by both medium layer and risk engine)
+        # ----------------------------------------------------------------
+        gov_output = self.governor.apply_governance(current_date)
+        if gov_output is not None:
+            capital_weights_today = gov_output.capital_weights
+            dyn_max_upro          = gov_output.dynamic_max_upro
+            conviction_budget     = gov_output.conviction_state.conviction_budget
+        else:
+            n = len(strategy_portfolios)
+            capital_weights_today = {k: 1/n for k in strategy_portfolios}
+            dyn_max_upro          = 0.35
+            conviction_budget     = 0.0
 
         # ----------------------------------------------------------------
         # 1. SLOW LAYER (monthly)
@@ -519,53 +533,38 @@ class MultiHorizonCoordinator:
         )
 
         if should_update_medium:
-            # 2a. Get capital weights from Conviction Governor
-            gov_output = self.governor.apply_governance(current_date)
-            if gov_output is not None:
-                capital_weights    = gov_output.capital_weights
-                dynamic_max_upro   = gov_output.dynamic_max_upro
-                dynamic_max_weight = gov_output.dynamic_max_weight
-                conviction_budget  = gov_output.conviction_state.conviction_budget
-            else:
-                # Governor has no data for this date → equal weights
-                n = len(strategy_portfolios)
-                capital_weights    = {k: 1/n for k in strategy_portfolios}
-                dynamic_max_upro   = 0.35
-                dynamic_max_weight = 0.30
-                conviction_budget  = 0.0
+            capital_weights = capital_weights_today
 
-            # 2b. Blend strategy asset weights using capital weights
+            # Blend strategy asset weights using capital weights
             blended: Dict[str, float] = {}
             for strat, cap_w in capital_weights.items():
                 port = strategy_portfolios.get(strat, {})
                 for asset, w in port.items():
                     blended[asset] = blended.get(asset, 0.0) + cap_w * w
 
-            # 2c. Record pre-bias exposure for diagnostics
             pre_bias_buckets = classify_weights(blended)
             pre_bias_upro    = blended.get("UPRO", 0.0)
 
-            # 2d. Apply posture bias
             biased = self._apply_posture_bias(blended, sl)
 
-            # Record post-bias exposure
             post_bias_buckets = classify_weights(biased)
             post_bias_upro    = biased.get("UPRO", 0.0)
 
             self._diag_records.append({
-                "date":             current_date,
-                "posture":          sl.risk_posture,
-                "intensity":        sl.posture_intensity,
-                "pre_equity":       pre_bias_buckets["equity"],
-                "post_equity":      post_bias_buckets["equity"],
-                "pre_upro":         pre_bias_upro,
-                "post_upro":        post_bias_upro,
+                "date":              current_date,
+                "posture":           sl.risk_posture,
+                "intensity":         sl.posture_intensity,
+                "pre_equity":        pre_bias_buckets["equity"],
+                "post_equity":       post_bias_buckets["equity"],
+                "pre_upro":          pre_bias_upro,
+                "post_upro":         post_bias_upro,
+                "post_risk_upro":    0.0,   # filled in after risk engine
+                "post_fast_upro":    0.0,   # filled in after fast layer
                 "conviction_budget": conviction_budget,
-                "s1_weight":        capital_weights.get("s1", 1/3),
+                "s1_weight":         capital_weights.get("s1", 1/3),
             })
 
-            # 2e. Apply slow layer bounds
-            self.medium_weights = apply_slow_layer_bounds(biased, sl)
+            self.medium_weights     = apply_slow_layer_bounds(biased, sl)
             self.last_medium_update = current_date
 
             metadata["medium_layer"] = {
@@ -574,7 +573,7 @@ class MultiHorizonCoordinator:
                 "s2_capital":        capital_weights.get("s2", 1/3),
                 "s3_capital":        capital_weights.get("s3", 1/3),
                 "conviction_budget": conviction_budget,
-                "dynamic_max_upro":  dynamic_max_upro,
+                "dynamic_max_upro":  dyn_max_upro,
                 "pre_bias_equity":   pre_bias_buckets["equity"],
                 "post_bias_equity":  post_bias_buckets["equity"],
                 "pre_bias_upro":     pre_bias_upro,
@@ -584,19 +583,49 @@ class MultiHorizonCoordinator:
             metadata["medium_layer"] = {"updated": False}
 
         # ----------------------------------------------------------------
-        # 3. FAST LAYER (daily — always runs)
+        # 3. RISK ENGINE (daily)
         # ----------------------------------------------------------------
-        final_weights, fast_action = compute_fast_layer(
-            self.medium_weights, spy_prices, current_date, transition_hazard
+        a_row = analog_scores_row or {}
+
+        risk_adjusted, risk_meta = self._risk_engine.apply(
+            proposed_weights  = self.medium_weights,
+            strategy_weights  = strategy_portfolios,
+            analog_scores_row = a_row,
+            spy_prices        = spy_prices,
+            current_date      = current_date,
+            stress_score      = 0.0,        # hazard excluded; uncertainty covers stress
+            dynamic_max_upro  = dyn_max_upro,
         )
 
+        post_risk_upro = risk_adjusted.get("UPRO", 0.0)
+        if self._diag_records:
+            self._diag_records[-1]["post_risk_upro"] = post_risk_upro
+
+        metadata["risk_engine"] = {
+            "uncertainty_score": risk_meta.get("uncertainty_score", 0.0),
+            "tightening_level":  risk_meta.get("tightening_level",  0.0),
+            "pre_upro":          self.medium_weights.get("UPRO", 0.0),
+            "post_upro":         post_risk_upro,
+        }
+
+        # ----------------------------------------------------------------
+        # 4. FAST LAYER (daily — always runs)
+        # ----------------------------------------------------------------
+        final_weights, fast_action = compute_fast_layer(
+            risk_adjusted, spy_prices, current_date, transition_hazard
+        )
+
+        post_fast_upro = final_weights.get("UPRO", 0.0)
+        if self._diag_records:
+            self._diag_records[-1]["post_fast_upro"] = post_fast_upro
+
         metadata["fast_layer"] = {
-            "override_active":      fast_action.override_active,
-            "reduction_factor":     fast_action.reduction_factor,
-            "circuit_breaker":      fast_action.circuit_breaker_level,
-            "crash_momentum":       fast_action.crash_momentum_active,
-            "hazard_triggered":     fast_action.hazard_triggered,
-            "transition_hazard":    transition_hazard,
+            "override_active":   fast_action.override_active,
+            "reduction_factor":  fast_action.reduction_factor,
+            "circuit_breaker":   fast_action.circuit_breaker_level,
+            "crash_momentum":    fast_action.crash_momentum_active,
+            "hazard_triggered":  fast_action.hazard_triggered,
+            "transition_hazard": transition_hazard,
         }
 
         return final_weights, metadata
@@ -772,6 +801,16 @@ def backtest_multi_horizon_v9(
 
         strategy_portfolios = {"s1": w1, "s2": w2, "s3": w3}
 
+        # Analog scores row for risk engine uncertainty
+        a_row: Dict[str, float] = {}
+        if date in analog_scores.index:
+            row = analog_scores.loc[date]
+            a_row = {
+                "coherence":         float(row.get("coherence",         0.5)),
+                "reliability":       float(row.get("reliability",       0.5)),
+                "transition_hazard": float(row.get("transition_hazard", 0.5)),
+            }
+
         # Process through coordinator
         final_w, meta = coordinator.process(
             strategy_portfolios = strategy_portfolios,
@@ -780,6 +819,7 @@ def backtest_multi_horizon_v9(
             current_date        = date,
             trading_index       = trading_idx,
             transition_hazard   = haz,
+            analog_scores_row   = a_row,
         )
 
         # Compute daily return
@@ -795,8 +835,11 @@ def backtest_multi_horizon_v9(
             "posture":      meta["slow_layer"].get("risk_posture", "unknown"),
             "composite":    sc,
             "s1_capital":   meta["medium_layer"].get("s1_capital", 1/3),
-            "fast_override": meta["fast_layer"].get("override_active", False),
-            "hazard":       haz,
+            "fast_override":      meta["fast_layer"].get("override_active", False),
+            "hazard":             haz,
+            "uncertainty_score":  meta["risk_engine"].get("uncertainty_score", 0.0),
+            "post_risk_upro":     meta["risk_engine"].get("post_upro", 0.0),
+            "post_fast_upro":     final_w.get("UPRO", 0.0),
         })
 
     if not results:
@@ -947,6 +990,32 @@ def validate_multi_horizon(results: Dict[str, Any]) -> bool:
                   f"equity {pre_eq:.1%}→{post_eq:.1%}  "
                   f"UPRO {pre_up:.2%}→{post_up:.2%}  "
                   f"(N={mask.sum()})")
+            
+    # ---- UPRO stage diagnostics ----
+    df = results["daily_df"]
+    if "post_risk_upro" in df.columns:
+        print(f"\n  UPRO STAGE DIAGNOSTICS:")
+        upro_cols = {
+            "post-bias":        "post_upro",
+            "post-risk-engine": "post_risk_upro",
+            "post-fast-layer":  "post_fast_upro",
+        }
+        for label, col in upro_cols.items():
+            if col not in exp_diag.columns and col not in df.columns:
+                continue
+            src = exp_diag[col] if col in exp_diag.columns else df[col]
+            presence = float((src > 0.01).mean())
+            mean_when = float(src[src > 0.01].mean()) if (src > 0.01).any() else 0.0
+            print(f"    {label:<20}: present {presence:.1%} of days  "
+                  f"mean-when-present = {mean_when:.2%}")
+
+    # ---- Uncertainty score distribution ----
+    if "uncertainty_score" in df.columns:
+        unc = df["uncertainty_score"].dropna()
+        print(f"\n  UNCERTAINTY SCORE (risk engine):")
+        print(f"    Mean={unc.mean():.3f}  Median={unc.median():.3f}  "
+              f"Std={unc.std():.3f}  "
+              f"P90={unc.quantile(0.90):.3f}")
 
     # ---- Pass criteria ----
     kurtosis   = float(mh.get("kurtosis", float("nan")))
@@ -977,6 +1046,13 @@ def validate_multi_horizon(results: Dict[str, Any]) -> bool:
             "Sharpe ≥ 1.0 standalone",
             (not np.isnan(sharpe_val)) and sharpe_val >= 1.0,
             f"actual = {sharpe_val:.3f}",
+        ),
+        (
+            "Uncertainty score varies (std > 0.02)",
+            float(df["uncertainty_score"].std()) > 0.02
+            if "uncertainty_score" in df.columns else False,
+            f"std = {float(df['uncertainty_score'].std()):.4f}"
+            if "uncertainty_score" in df.columns else "no data",
         ),
         (
             "Fast layer high-severity override >10% reduction: 10-35% of days",
